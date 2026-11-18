@@ -1040,6 +1040,32 @@ _FAKE_LAST_COMMIT = {"id": "oid", "title": "title", "date": "2025-01-01T00:00:00
 
 
 def test_info_refresh_bypasses_parent_listing_cache():
+    cached_file = RepoFile(path="new.txt", size=3, oid="abc")
+    fresh_file = RepoFile(path="new.txt", size=10, oid="def")
+    with (
+        patch.object(HfApi, "repo_info"),
+        patch.object(HfApi, "list_repo_tree", return_value=[cached_file]),
+        patch.object(HfApi, "get_paths_info", return_value=[fresh_file]) as get_paths_info,
+    ):
+        fs = HfFileSystem(skip_instance_cache=True)
+        assert fs.ls("alice/demo", detail=False) == ["alice/demo/new.txt"]  # the listing is now cached
+
+        assert fs.info("alice/demo/new.txt")["size"] == 3  # served from the cached listing
+
+        assert fs.info("alice/demo/new.txt", refresh=True) == {
+            "name": "alice/demo/new.txt",
+            "size": 10,
+            "type": "file",
+        }
+        assert get_paths_info.call_count == 1
+
+
+def test_info_outdated_parent_listing_is_looked_up_individually():
+    """Regression test for https://github.com/huggingface/huggingface_hub/issues/5383.
+
+    A path missing from an already cached listing may have been created after the listing was fetched, so it
+    must be looked up individually before concluding that it doesn't exist.
+    """
     new_file = RepoFile(path="new.txt", size=3, oid="abc")
     with (
         patch.object(HfApi, "repo_info"),
@@ -1047,18 +1073,16 @@ def test_info_refresh_bypasses_parent_listing_cache():
         patch.object(HfApi, "get_paths_info", return_value=[new_file]) as get_paths_info,
     ):
         fs = HfFileSystem(skip_instance_cache=True)
-        assert fs.ls("alice/demo", detail=False) == []
+        assert fs.ls("alice/demo", detail=False) == []  # the empty listing is now cached
 
-        with pytest.raises(FileNotFoundError):
-            fs.info("alice/demo/new.txt")
-        assert get_paths_info.call_count == 0
-
-        assert fs.info("alice/demo/new.txt", refresh=True) == {
-            "name": "alice/demo/new.txt",
-            "size": 3,
-            "type": "file",
-        }
+        assert fs.info("alice/demo/new.txt") == {"name": "alice/demo/new.txt", "size": 3, "type": "file"}
         assert get_paths_info.call_count == 1
+
+        # A path that really doesn't exist is still reported as missing, with a single lookup
+        get_paths_info.return_value = []
+        with pytest.raises(FileNotFoundError):
+            fs.info("alice/demo/nope.txt")
+        assert get_paths_info.call_count == 2
 
 
 class FakeTreeApi:
@@ -1152,6 +1176,90 @@ def _fake_fs(files: dict[str, int], max_workers: int, **fake_kwargs) -> tuple[Hf
     fs = HfFileSystem(endpoint="https://fake.example.com", skip_instance_cache=True, max_workers=max_workers)
     fs._api = api
     return fs, api
+
+
+def test_outdated_listing_is_not_cached():
+    """Regression test for https://github.com/huggingface/huggingface_hub/issues/5383.
+
+    A listing is cached once its request is over, so it can land after a change that already invalidated it
+    (a file written meanwhile, from this instance or from another process). Such an outdated listing must be
+    dropped rather than resurrected in the cache.
+    """
+    fs, api = _fake_fs({"dir_a/file.txt": 1}, max_workers=1)
+    listed = threading.Event()
+    unblock = threading.Event()
+    real_list_repo_tree = api.list_repo_tree
+
+    def slow_list_repo_tree(*args, **kwargs):
+        entries = list(real_list_repo_tree(*args, **kwargs))  # response is fetched now...
+        listed.set()
+        unblock.wait(10)  # ...and only lands once the test says so
+        yield from entries
+
+    api.list_repo_tree = slow_list_repo_tree
+
+    thread = threading.Thread(target=lambda: fs.ls(f"{_FAKE_REPO}/dir_a", detail=False))
+    thread.start()
+    assert listed.wait(10)
+
+    fs.invalidate_cache(f"{_FAKE_REPO}/dir_a/new.txt")  # what committing `new.txt` does
+    unblock.set()
+    thread.join(10)
+
+    assert f"{_FAKE_REPO}/dir_a" not in fs.dircache  # the outdated listing was dropped, not resurrected
+
+    # A listing fetched after the change is cached as usual
+    assert fs.ls(f"{_FAKE_REPO}/dir_a", detail=False) == [f"{_FAKE_REPO}/dir_a/file.txt"]
+    assert f"{_FAKE_REPO}/dir_a" in fs.dircache
+
+
+def test_dircache_can_be_used_by_several_threads():
+    """Regression test for https://github.com/huggingface/huggingface_hub/issues/5383.
+
+    The cache is filled by whoever lists and dropped by whoever writes, and copying an instance (to pickle it or
+    to hand it over to a new thread) walks it. Doing any of those from several threads must neither raise nor
+    leave a corrupted cache behind.
+    """
+    nb_folders = 3000
+    fs, _ = _fake_fs(
+        {f"dir{i:04d}/file{j}.txt": j for i in range(nb_folders) for j in range(2)}, max_workers=1, delay=0.002
+    )
+    errors: list[Exception] = []
+
+    def run(fn, nb):
+        for index in range(nb):
+            try:
+                fn(index)
+            except Exception as e:
+                errors.append(e)
+
+    def folder(offset, index, step):
+        # spread the folders over the whole repo so that listings mostly miss the cache
+        return f"{_FAKE_REPO}/dir{(offset + index * step) % nb_folders:04d}"
+
+    threads = [
+        *[
+            threading.Thread(target=run, args=(lambda i, off=o: fs.ls(folder(off, i, 97), detail=False), 80))
+            for o in (0, 1000, 2000)
+        ],
+        *[
+            threading.Thread(
+                target=run, args=(lambda i, off=o: fs.invalidate_cache(f"{folder(off, i, 53)}/file0.txt"), 80)
+            )
+            for o in (500, 1500)
+        ],
+        *[threading.Thread(target=run, args=(lambda i: pickle.dumps(fs), 80)) for _ in range(2)],
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+
+    assert not errors
+    assert fs.ls(f"{_FAKE_REPO}/dir0007", detail=False) == [
+        f"{_FAKE_REPO}/dir0007/file0.txt",
+        f"{_FAKE_REPO}/dir0007/file1.txt",
+    ]
 
 
 def test_find_large_repo_is_listed_in_parallel():

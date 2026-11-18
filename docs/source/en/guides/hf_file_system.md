@@ -105,6 +105,12 @@ A few things to know about it:
 - Following starts as soon as a bucket is listed, and one background connection is kept open per followed
   bucket, shared by all [`HfFileSystem`] instances. That is why the option is opt-in.
 
+Note: a stale listing can make `ls`, `find` and `glob` miss a path that was just added, but it cannot hide it
+from [`HfFileSystem.info`], [`HfFileSystem.exists`] or [`HfFileSystem.open`]: when a path is missing from a
+listing that was already cached, it is looked up individually before raising `FileNotFoundError`. A listing is
+also never cached when a change landed while it was being fetched, which is what happens when a thread or a
+process writes to a folder exactly while another one lists it.
+
 ## Transactions
 
 [`HfFileSystem`] supports [fsspec transactions](https://filesystem-spec.readthedocs.io/en/latest/features.html#transactions) for buckets only.

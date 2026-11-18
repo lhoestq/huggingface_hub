@@ -159,6 +159,35 @@ class TestHfFileSystemBucketRW(_HfFileSystemBucketChecks, _HfFileSystemBaseRWTes
         finally:
             self.api.delete_repo(repo_id, repo_type="model")
 
+    def test_read_files_written_outside_of_the_filesystem(self):
+        """Regression test for https://github.com/huggingface/huggingface_hub/issues/5383.
+
+        Files written without going through `self.hffs` (another process, another instance, another thread,
+        ...) are absent from its cached listings. Reading them back must not depend on a listing being
+        up-to-date, otherwise a file that exists cannot be opened.
+        """
+        assert self.hffs.ls(self.hf_path, detail=False)  # cache the listing of the bucket root
+        assert self.hffs.ls(self.hf_path + "/data", detail=False)  # ...and the one of the data folder
+
+        self.api.batch_bucket_files(
+            self.bucket_id,
+            add=[(b"external data", "data/new.txt"), (b"external data", "newdir/deep/new.txt")],
+        )
+
+        new_file = self.hf_path + "/data/new.txt"
+        assert self.hffs.info(new_file)["size"] == len(b"external data")
+        assert self.hffs.cat(new_file) == b"external data"
+
+        # A folder is virtual in a bucket: it exists as soon as it has at least one child
+        assert self.hffs.isdir(self.hf_path + "/newdir")
+        assert self.hffs.info(self.hf_path + "/newdir/deep")["type"] == "directory"
+        assert self.hffs.cat(self.hf_path + "/newdir/deep/new.txt") == b"external data"
+
+        # Paths that really don't exist are still reported as missing
+        assert not self.hffs.exists(self.hf_path + "/data/nope.txt")
+        assert not self.hffs.exists(self.hf_path + "/nope")
+        assert not self.hffs.isdir(self.hf_path + "/nope")
+
     def test_write_file_in_transaction(self):
         data = "new text data"
         with self.hffs.transaction:
