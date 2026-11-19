@@ -328,10 +328,9 @@ class _Cached(_cached_base):
     be made for a filesystem instance to be garbage collected.
 
     This is a slightly modified version of `fsspec.spec._Cached` to improve it.
-    In particular in `_tokenize` the pid isn't taken into account for the
-    `fs_token` used to identify cached instances. The `fs_token` logic is also
-    robust to defaults values and the order of the args. Finally new instances
-    reuse the states from sister instances in the main thread.
+    In particular in `_tokenize` neither the pid nor the thread is taken into account for the `fs_token` used
+    to identify cached instances: an instance is shared by every thread of the process using the same options.
+    The `fs_token` logic is also robust to defaults values and the order of the args.
     """
 
     def __init__(cls, *args, **kwargs):
@@ -341,6 +340,9 @@ class _Cached(_cached_base):
         # collecting instances when all other references are gone. To really
         # delete a FileSystem, the cache must be cleared.
         cls._cache = {}
+        # As instances are shared across threads, two threads creating an instance at the same time must not
+        # end up with two different ones (each with its own cache). Creation is cheap (no request).
+        cls._cache_lock = threading.RLock()
 
     def __call__(cls, *args, **kwargs):
         # Hack: override https://github.com/fsspec/filesystem_spec/blob/dcb167e8f50e6273d4cfdfc4cab8fc5aa4c958bf/fsspec/spec.py#L65
@@ -348,20 +350,13 @@ class _Cached(_cached_base):
         # HfFileSystem picks up defaults the same way other fsspec filesystems do.
         kwargs = apply_config(cls, kwargs)
         skip = kwargs.pop("skip_instance_cache", False)
-        fs_token = cls._tokenize(cls, threading.get_ident(), *args, **kwargs)
-        fs_token_main_thread = cls._tokenize(cls, threading.main_thread().ident, *args, **kwargs)
-        if not skip and cls.cachable and fs_token in cls._cache:
-            # reuse cached instance
-            cls._latest = fs_token
-            return cls._cache[fs_token]
-        else:
-            # create new instance
+        fs_token = cls._tokenize(*args, **kwargs)
+        with cls._cache_lock:
+            if not skip and cls.cachable and fs_token in cls._cache:
+                # reuse cached instance
+                cls._latest = fs_token
+                return cls._cache[fs_token]
             obj = type.__call__(cls, *args, **kwargs)
-            if not skip and cls.cachable and fs_token_main_thread in cls._cache:
-                # reuse the cache from the main thread instance in the new instance
-                instance_state = cls._cache[fs_token_main_thread]._get_instance_state()
-                for attr, state_value in instance_state.items():
-                    setattr(obj, attr, state_value)
             obj._fs_token_ = fs_token
             obj.storage_args = args
             obj.storage_options = kwargs
@@ -444,6 +439,10 @@ class HfFileSystem(fsspec.AbstractFileSystem, metaclass=_Cached):  # ty: ignore[
     >>> from huggingface_hub import HfFileSystem
     >>> hffs = HfFileSystem(token=token)
     ```
+
+    An instance is cached per set of options and shared by every thread of the process, so `HfFileSystem()`
+    called from several threads returns the same one. A transaction only defers the writes of the thread that
+    runs it.
     """
 
     root_marker = ""
@@ -460,6 +459,8 @@ class HfFileSystem(fsspec.AbstractFileSystem, metaclass=_Cached):  # ty: ignore[
         live_follow: bool | None = None,
         **storage_options,
     ):
+        # Set before `super().__init__()` which starts using the `_intrans` and `_transaction` properties below
+        self._trans_local = threading.local()
         super().__init__(*args, **storage_options)
         self.endpoint = endpoint or constants.ENDPOINT
         self.token = token
@@ -468,7 +469,7 @@ class HfFileSystem(fsspec.AbstractFileSystem, metaclass=_Cached):  # ty: ignore[
         self.expand_info = expand_info
         self.max_workers = max_workers
         self.live_follow = live_follow
-        # Filled by the live-follow threads, applied by `_ls_tree` so that `dircache` is only mutated by its owner
+        # Filled by the live-follow threads, drained and applied by `_ls_tree` under `_dircache_lock`
         self._pending_bucket_changes: deque[tuple[str, list[BucketFileChange] | None]] = deque()
         # Maps (repo_type, repo_id, revision) to a 2-tuple with:
         #  * the 1st element indicating whether the repository and the revision exist
@@ -489,15 +490,33 @@ class HfFileSystem(fsspec.AbstractFileSystem, metaclass=_Cached):  # ty: ignore[
         self._listings_generation: dict[str, int] = {}
         self._generation_tick = 0
 
+    @property
+    def _intrans(self) -> bool:
+        # An instance is shared by all the threads using it, while a transaction only defers the writes of the
+        # thread running it: `_intrans` and `_transaction` are therefore per-thread.
+        return getattr(self._trans_local, "intrans", False)
+
+    @_intrans.setter
+    def _intrans(self, value: bool) -> None:
+        self._trans_local.intrans = value
+
+    @property
+    def _transaction(self) -> Any:
+        return getattr(self._trans_local, "transaction", None)
+
+    @_transaction.setter
+    def _transaction(self, value: Any) -> None:
+        self._trans_local.transaction = value
+
     @classmethod
-    def _tokenize(cls, threading_ident: int, *args, **kwargs) -> str:
+    def _tokenize(cls, *args, **kwargs) -> str:
         """Deterministic token for caching"""
         # make fs_token robust to default values and to kwargs order
         kwargs["endpoint"] = kwargs.get("endpoint") or constants.ENDPOINT
         kwargs["token"] = kwargs.get("token")
         kwargs = {key: kwargs[key] for key in sorted(kwargs)}
-        # contrary to fsspec, we don't include pid here
-        tokenize_args = (cls, threading_ident, args, kwargs)
+        # contrary to fsspec, we don't include pid here, nor the thread: an instance is shared across threads
+        tokenize_args = (cls, args, kwargs)
         h = md5(str(tokenize_args).encode())
         return h.hexdigest()
 
@@ -694,7 +713,7 @@ class HfFileSystem(fsspec.AbstractFileSystem, metaclass=_Cached):  # ty: ignore[
 
     def _apply_bucket_changes(self, bucket_id: str, changes: Iterable[BucketFileChange]) -> None:
         """
-        Apply a batch of live-follow changes to the dircache. Called by `_ls_tree`, on the thread owning the instance.
+        Apply a batch of live-follow changes to the dircache. Called by `_ls_tree`.
 
         A change is applied as an invalidation of the cached listings of every parent directory of the changed
         path (up to the bucket root), plus the subtree under that path in case it was itself listed as a
@@ -716,7 +735,7 @@ class HfFileSystem(fsspec.AbstractFileSystem, metaclass=_Cached):  # ty: ignore[
         with BUCKET_FOLLOWERS_LOCK:
             if key in BUCKET_FOLLOWERS and (subscribers := BUCKET_FOLLOWERS[key][1]):
                 if id(self) not in subscribers:
-                    # Joining a running follower: drop the listings this instance may have copied from a sibling
+                    # Joining a running follower: drop the listings cached before the subscription started
                     subscribers[id(self)] = self
                     self._invalidate_bucket_tree(bucket_id)
                 return
@@ -1914,6 +1933,13 @@ def reopen(fs: HfFileSystem, path: str, mode: str, block_size: int, cache_type: 
 
 def make_instance(cls, args, kwargs, instance_state):
     fs = cls(*args, **kwargs)
+    dircache = instance_state.pop("dircache", None)
+    if dircache:
+        with fs._dircache_lock:
+            # Unpickling in a process where an instance with the same options already lives returns that
+            # instance: its listings are the fresher ones, so only the missing ones are added here.
+            for path, path_infos in dircache.items():
+                fs.dircache.setdefault(path, path_infos)
     for attr, state_value in instance_state.items():
         setattr(fs, attr, state_value)
     return fs

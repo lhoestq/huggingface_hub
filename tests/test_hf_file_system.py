@@ -427,10 +427,9 @@ class _HfFileSystemBaseROTests(_HfFileSystemBaseTests):
         # 1. The pre-pickle fs must hit an endpoint where `text_file` actually exists, so the initial
         #    `isfile` call resolves cleanly and populates exactly one cache entry. Going against
         #    production would 404 and trigger the namespace fallback in `resolve_path`, adding 2 entries.
-        # 2. The pre-pickle fs must NOT be shared via fsspec's instance cache with any sibling test
-        #    (e.g. the bucket-based `test_pickle` inherited by `HfFileSystemBucketROTests`), otherwise
-        #    leftover `_bucket_exists_cache` / `dircache` entries from that test leak into this one
-        #    via the main-thread state-inheritance path in `_Cached.__call__`.
+        # 2. The pre-pickle fs must NOT be shared via fsspec's instance cache with any sibling test,
+        #    otherwise leftover `_bucket_exists_cache` / `dircache` entries from that test leak into the
+        #    unpickled instance (unpickling returns the instance cached for those options, if any).
         # `skip_instance_cache=True` guarantees a fresh instance regardless of what earlier tests ran.
         fs = HfFileSystem(endpoint=ENDPOINT_STAGING, token=TOKEN, skip_instance_cache=True)
         fs.isfile(self.text_file)
@@ -993,6 +992,11 @@ def _get_fs_token_and_dircache(fs):
     return fs._fs_token, fs.dircache
 
 
+def _cached_fs(_):
+    fs = HfFileSystem()
+    return fs._fs_token, fs.dircache
+
+
 def test_cache():
     HfFileSystem.clear_instance_cache()
     fs = HfFileSystem()
@@ -1021,7 +1025,21 @@ def test_cache():
         (fs_token, dircache), (_, another_dircache) = pool.map(_get_fs_token_and_dircache, [fs, another_fs])
         assert dircache == fs.dircache
         assert another_dircache != fs.dircache
-        assert fs_token != fs._fs_token  # use a different instance for thread safety
+        # an instance is shared by all the threads of the process, unlike a process which gets its own
+        assert fs_token == fs._fs_token
+
+
+def test_instance_is_shared_between_threads():
+    """Threads using the same options share a single instance, and therefore a single cache."""
+    HfFileSystem.clear_instance_cache()
+    fs = HfFileSystem()
+    fs.dircache = {"dummy": []}
+
+    with multiprocessing.pool.ThreadPool() as pool:
+        results = pool.map(_cached_fs, [0, 1, 2])
+
+    assert all(fs_token == fs._fs_token for fs_token, _ in results)
+    assert all(dircache is fs.dircache for _, dircache in results)
 
 
 @pytest.mark.production
