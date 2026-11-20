@@ -1233,6 +1233,30 @@ class HfFileSystem(fsspec.AbstractFileSystem, metaclass=_Cached):  # ty: ignore[
         else:
             raise NotImplementedError(f"Cannot determined 'modified' for path '{path}' (info: {info})")
 
+    def _bucket_path_info(self, resolved_path: HfFileSystemResolvedBucketPath, path: str) -> dict[str, Any] | None:
+        """
+        Get info about a single bucket path, bypassing cached listings. None if the path doesn't exist.
+
+        Called by `info()` when a path is missing from a listing that was already cached: only the path
+        itself is requested, which is much cheaper than listing its parent folder again.
+        """
+        bucket_file = next(iter(self._api.get_bucket_paths_info(resolved_path.bucket_id, [resolved_path.path])), None)
+        if bucket_file is not None:
+            return _cache_info_from_path_info(bucket_file, path)
+        # Not a file: a bucket folder is virtual, it exists as soon as it has at least one child. Request the
+        # children of the path (the trailing "/" avoids matching paths only sharing a prefix with it) and stop
+        # as soon as one is returned: the request is paginated so at most one page is fetched.
+        children = self._api.list_bucket_tree(resolved_path.bucket_id, f"{resolved_path.path}/", recursive=False)
+        try:
+            has_child = next(iter(children), None) is not None
+        except EntryNotFoundError:
+            has_child = False  # the Hub answers 404 when no path matches the prefix
+        if not has_child:
+            return None
+        # Same format as `_cache_info_from_path_info` on a `BucketFolder`, except `uploaded_at` which would
+        # require listing the full folder to be resolved (it's the max of the `uploaded_at` of its children).
+        return {"name": path, "size": 0, "type": "directory", "uploaded_at": None}
+
     def info(self, path: str, refresh: bool = False, revision: str | None = None, **kwargs) -> dict[str, Any]:
         """
         Get information about a file or directory.
@@ -1283,24 +1307,38 @@ class HfFileSystem(fsspec.AbstractFileSystem, metaclass=_Cached):  # ty: ignore[
                 }
         elif isinstance(resolved_path, HfFileSystemResolvedBucketPath):
             parent_path = self._parent(path)
+            parent_was_cached = parent_path in self.dircache
             # Fill the cache with cheap call
             self.ls(parent_path, refresh=refresh)
-            out1 = [o for o in self.dircache[parent_path] if o["name"] == path]
-            if not out1:
+            out1 = [o for o in self.dircache.get(parent_path, []) if o["name"] == path]
+            if out1:
+                out = out1[0]
+            elif parent_was_cached and not refresh:
+                # The path is missing from a listing that was already cached, and a cached listing can be
+                # outdated: the path may have been created after the listing was fetched, either by another
+                # process or by a concurrent thread listing the parent folder before a write landed.
+                # Look the path up directly before concluding it doesn't exist.
+                # See https://github.com/huggingface/huggingface_hub/issues/5383
+                out = self._bucket_path_info(resolved_path, path)
+                if out is None:
+                    _raise_file_not_found(path, None)
+            else:
                 _raise_file_not_found(path, None)
-            out = out1[0]
         else:
             out = None
             parent_path = self._parent(path)
-            if not refresh and not expand_info and parent_path not in self.dircache:
+            parent_was_cached = parent_path in self.dircache
+            if not refresh and not expand_info and not parent_was_cached:
                 # Fill the cache with cheap call
                 self.ls(parent_path)
             if not refresh and parent_path in self.dircache:
-                # Check if the path is in the cache
+                # Check if the path is in the cache. A miss is only conclusive if the listing has just been
+                # fetched, otherwise it is looked up individually below (see above).
                 out1 = [o for o in self.dircache[parent_path] if o["name"] == path]
-                if not out1:
+                if out1:
+                    out = out1[0]
+                elif not parent_was_cached:
                     _raise_file_not_found(path, None)
-                out = out1[0]
             if refresh or out is None or (expand_info and out and out["last_commit"] is None):
                 paths_info = self._api.get_paths_info(
                     resolved_path.repo_id,

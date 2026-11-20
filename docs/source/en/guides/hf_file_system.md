@@ -80,6 +80,11 @@ parents) or everywhere when called without argument:
 ['buckets/my-username/my-bucket/data/train.csv', 'buckets/my-username/my-bucket/data/new-file.csv']
 ```
 
+A stale listing can make `ls`, `find` and `glob` miss a path that was just added, but it cannot hide it from
+[`HfFileSystem.info`], [`HfFileSystem.exists`] or [`HfFileSystem.open`]: when a path is missing from a listing
+that was already cached, it is looked up individually before raising `FileNotFoundError`. It is what makes a
+file readable right after it was written from another thread or another process.
+
 For buckets, `huggingface_hub` can do that for you: the Hub streams the file changes of a bucket as they happen
 and [`HfFileSystem`] drops the listings affected by a change as soon as it arrives. Enable it with
 `live_follow=True`:

@@ -1040,6 +1040,32 @@ _FAKE_LAST_COMMIT = {"id": "oid", "title": "title", "date": "2025-01-01T00:00:00
 
 
 def test_info_refresh_bypasses_parent_listing_cache():
+    cached_file = RepoFile(path="new.txt", size=3, oid="abc")
+    fresh_file = RepoFile(path="new.txt", size=10, oid="def")
+    with (
+        patch.object(HfApi, "repo_info"),
+        patch.object(HfApi, "list_repo_tree", return_value=[cached_file]),
+        patch.object(HfApi, "get_paths_info", return_value=[fresh_file]) as get_paths_info,
+    ):
+        fs = HfFileSystem(skip_instance_cache=True)
+        assert fs.ls("alice/demo", detail=False) == ["alice/demo/new.txt"]  # the listing is now cached
+
+        assert fs.info("alice/demo/new.txt")["size"] == 3  # served from the cached listing, no extra request
+
+        assert fs.info("alice/demo/new.txt", refresh=True) == {
+            "name": "alice/demo/new.txt",
+            "size": 10,
+            "type": "file",
+        }
+        assert get_paths_info.call_count == 1
+
+
+def test_info_outdated_parent_listing_is_looked_up_individually():
+    """Regression test for https://github.com/huggingface/huggingface_hub/issues/5383.
+
+    A path missing from an already cached listing may have been created after the listing was fetched, so it
+    must be looked up individually before concluding that it doesn't exist.
+    """
     new_file = RepoFile(path="new.txt", size=3, oid="abc")
     with (
         patch.object(HfApi, "repo_info"),
@@ -1047,18 +1073,16 @@ def test_info_refresh_bypasses_parent_listing_cache():
         patch.object(HfApi, "get_paths_info", return_value=[new_file]) as get_paths_info,
     ):
         fs = HfFileSystem(skip_instance_cache=True)
-        assert fs.ls("alice/demo", detail=False) == []
+        assert fs.ls("alice/demo", detail=False) == []  # the empty listing is now cached
 
-        with pytest.raises(FileNotFoundError):
-            fs.info("alice/demo/new.txt")
-        assert get_paths_info.call_count == 0
-
-        assert fs.info("alice/demo/new.txt", refresh=True) == {
-            "name": "alice/demo/new.txt",
-            "size": 3,
-            "type": "file",
-        }
+        assert fs.info("alice/demo/new.txt") == {"name": "alice/demo/new.txt", "size": 3, "type": "file"}
         assert get_paths_info.call_count == 1
+
+        # A path that really doesn't exist is still reported as missing, with a single lookup
+        get_paths_info.return_value = []
+        with pytest.raises(FileNotFoundError):
+            fs.info("alice/demo/nope.txt")
+        assert get_paths_info.call_count == 2
 
 
 class FakeTreeApi:
